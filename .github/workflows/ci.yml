@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Every week we check the pipeline
+    # 2330 UTC Sunday == 0930 AEST Monday
+    - cron: '30 23 * * 0'
+  workflow_dispatch: # Add manual trigger
+
+env:
+  PACKAGE_NAME: 'Octopus.OctoVersion'
+  OCTOPUS_SPACE: Build Platform
+  OCTOPUS_PROJECT: OctoVersion
+  OCTOVERSION_CurrentBranch: ${{ github.head_ref || github.ref_name }}
+
+jobs:
+  build-test-and-pack:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required to obtain the ID token from GitHub Actions
+      contents: write # Read Required to check out code, Write to create Git Tags
+      statuses: write # Required to send commit status checks
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Append OCTOVERSION_CurrentBranch with -nightly-<timestamp> (for scheduled)
+        if: github.event_name == 'schedule'
+        run: |
+          echo "OCTOVERSION_CurrentBranch=${{ env.OCTOVERSION_CurrentBranch }}-nightly-$(date +'%Y%m%d%H%M%S')" >> $GITHUB_ENV
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+          
+      - name: Run Nuke
+        run: ./build.sh
+
+      - name: Git Tag (when not pre-release)
+        id: github-tag
+        if: ${{ !contains( env.OCTOVERSION_FullSemVer, '-' ) }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "refs/tags/${{ env.OCTOVERSION_FullSemVer }}",
+              sha: context.sha
+            })
+
+      - name: Login to Octopus
+        uses: OctopusDeploy/login@v1
+        with:
+          server: ${{ secrets.OCTOPUS_URL }}
+          service_account_id: e53e33e5-5352-40c2-a4cd-8d5c43987129
+
+      - name: Push build information to Octopus Deploy
+        uses: OctopusDeploy/push-build-information-action@v3
+        with:
+          packages: |
+            ${{ env.PACKAGE_NAME }}
+          version: ${{ env.OCTOVERSION_FullSemVer }}
+        
+      - name: Push a package to Octopus Deploy
+        uses: OctopusDeploy/push-package-action@v3
+        with:
+          overwrite_mode: IgnoreIfExists
+          packages: |
+            artifacts/*.${{ env.OCTOVERSION_FullSemVer }}.nupkg
+
+      - name: Create a release in Octopus
+        uses: OctopusDeploy/create-release-action@v3
+        with:
+          space: ${{ env.OCTOPUS_SPACE }}
+          project: ${{ env.OCTOPUS_PROJECT }}
+          git_ref: ${{ github.head_ref || github.ref_name }}
+          git_commit: ${{ github.event.after || github.event.pull_request.head.sha }}
+          release_number: ${{ env.OCTOVERSION_FullSemVer }}
+          package_version: ${{ env.OCTOVERSION_FullSemVer }}
